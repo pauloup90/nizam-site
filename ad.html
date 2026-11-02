@@ -34,13 +34,14 @@
       <button type="button" data-f="h" aria-pressed="false">عرضي 16:9</button>
       <button type="button" data-f="s" aria-pressed="false">مربع 1:1</button>
     </div>
-    <button type="button" class="main" id="play">تشغيل من الأول</button>
+    <button type="button" class="main" id="play">تشغيل بالصوت</button>
+    <div class="seg"><button type="button" id="snd" aria-pressed="true">الصوت شغال</button></div>
     <button type="button" class="rec" id="rec">نزّل الفيديو</button>
   </div>
   <div class="stage"><canvas id="out" aria-label="إعلان تطبيق نظام"></canvas></div>
   <div>
     <div class="progress"><i id="prog"></i></div>
-    <p class="note" id="note">الإعلان 30 ثانية. "نزّل الفيديو" بيسجّله من أوله لآخره وبيحفظه على جهازك.</p>
+    <p class="note" id="note">الإعلان 30 ثانية. اضغط "تشغيل بالصوت" عشان تسمع المزيكا، و"نزّل الفيديو" بيسجّله بالصوت وبيحفظه على جهازك.</p>
   </div>
 </div>
 
@@ -64,6 +65,117 @@
   function lerp(a, b, x) { return a + (b - a) * x; }
   // visible from a to b with fade length f
   function vis(t, a, b, f) { f = f || .4; return Math.min(seg(t, a, a + f), 1 - seg(t, b - f, b)); }
+
+  // ---- sound: a synthesized score + effects locked to the timeline ---------
+  // Everything is generated here (no samples), so there are no rights issues.
+  var actx = null, master = null, recDest = null, soundOn = true;
+  function audioInit() {
+    if (!actx) {
+      var AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return false;
+      actx = new AC();
+      recDest = actx.createMediaStreamDestination();
+    }
+    if (actx.state === 'suspended') actx.resume();
+    return true;
+  }
+  var noiseBuf = null;
+  function noise() {
+    if (!noiseBuf) {
+      noiseBuf = actx.createBuffer(1, actx.sampleRate * 2, actx.sampleRate);
+      var d = noiseBuf.getChannelData(0);
+      for (var i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    }
+    var s = actx.createBufferSource(); s.buffer = noiseBuf; s.loop = true; return s;
+  }
+  function env(g, t, a, peak, d) {
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(peak, t + a);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + a + d);
+  }
+  function tone(type, f, t, a, d, peak, out, f2) {
+    var o = actx.createOscillator(), g = actx.createGain();
+    o.type = type; o.frequency.setValueAtTime(f, t);
+    if (f2) o.frequency.exponentialRampToValueAtTime(f2, t + a + d);
+    env(g, t, a, peak, d); o.connect(g); g.connect(out);
+    o.start(t); o.stop(t + a + d + .05);
+  }
+  function whoosh(t, dur, out, up) {
+    var n = noise(), f = actx.createBiquadFilter(), g = actx.createGain();
+    f.type = 'bandpass'; f.Q.value = 1.2;
+    f.frequency.setValueAtTime(up ? 300 : 3000, t);
+    f.frequency.exponentialRampToValueAtTime(up ? 5000 : 250, t + dur);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(.35, t + dur * .55);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    n.connect(f); f.connect(g); g.connect(out); n.start(t); n.stop(t + dur + .05);
+  }
+  function kick(t, out, v) { tone('sine', 140, t, .002, .32, v || .9, out, 42); }
+  function hat(t, out) {
+    var n = noise(), f = actx.createBiquadFilter(), g = actx.createGain();
+    f.type = 'highpass'; f.frequency.value = 7500; env(g, t, .001, .12, .05);
+    n.connect(f); f.connect(g); g.connect(out); n.start(t); n.stop(t + .08);
+  }
+  function pop(t, out) { tone('sine', 900, t, .002, .09, .35, out, 1500); tone('triangle', 1800, t + .02, .002, .06, .12, out); }
+  function lock(t, out) { tone('square', 2400, t, .001, .03, .18, out); kick(t, out, .8); tone('sine', 55, t, .005, .6, .5, out); }
+  function impact(t, out) {
+    kick(t, out, 1); tone('sine', 41, t, .005, 1.8, .7, out);
+    var n = noise(), f = actx.createBiquadFilter(), g = actx.createGain();
+    f.type = 'lowpass'; f.frequency.setValueAtTime(6000, t); f.frequency.exponentialRampToValueAtTime(200, t + 1.5);
+    env(g, t, .005, .3, 1.5); n.connect(f); f.connect(g); g.connect(out); n.start(t); n.stop(t + 1.6);
+  }
+  function pad(t, freqs, dur, out) {
+    var f = actx.createBiquadFilter(), g = actx.createGain();
+    f.type = 'lowpass'; f.frequency.value = 1400; f.Q.value = .4;
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime(.07, t + .5);
+    g.gain.setValueAtTime(.07, t + dur - .4);
+    g.gain.linearRampToValueAtTime(0.0001, t + dur);
+    f.connect(g); g.connect(out);
+    freqs.forEach(function (fr) {
+      [-6, 6].forEach(function (cents) {
+        var o = actx.createOscillator(); o.type = 'sawtooth';
+        o.frequency.value = fr; o.detune.value = cents;
+        o.connect(f); o.start(t); o.stop(t + dur + .05);
+      });
+    });
+  }
+  // Schedules the whole 30 s score from audio time t0 into a fresh master bus.
+  function score(t0) {
+    if (master) { try { master.disconnect(); } catch (e) {} }
+    master = actx.createGain();
+    master.gain.value = soundOn ? .9 : 0;
+    var comp = actx.createDynamicsCompressor();
+    comp.threshold.value = -16; comp.ratio.value = 4;
+    master.connect(comp); comp.connect(actx.destination); comp.connect(recDest);
+    var out = master;
+    var beat = 60 / 100;                              // 100 BPM
+    var chords = [[220, 261.63, 329.63], [174.61, 220, 261.63], [130.81, 164.81, 196], [196, 246.94, 293.66]];
+    var bass = [110, 87.31, 65.41, 98];
+    for (var i = 0, t = 3.0; t < 27; i++, t += beat * 4) {
+      pad(t0 + t, chords[i % 4], beat * 4 + .2, out);
+      tone('sine', bass[i % 4], t0 + t, .02, beat * 3.6, .32, out);
+    }
+    for (var b = 0, tb = 3.0; tb < 27; b++, tb += beat) {
+      if (b % 2 === 0 || tb > 17) kick(t0 + tb, out, .55);
+      if (tb > 6) hat(t0 + tb + beat / 2, out);
+    }
+    whoosh(t0 + .05, 1.3, out, false); lock(t0 + 1.4, out);
+    whoosh(t0 + 2.6, .55, out, true);
+    whoosh(t0 + 5.5, 1.6, out, false);
+    pop(t0 + 8.45, out);
+    whoosh(t0 + 12.0, 1.2, out, true);
+    pop(t0 + 14.05, out);
+    [0, .18, .36].forEach(function (d) { whoosh(t0 + 17.15 + d, .6, out, false); });
+    pop(t0 + 19.45, out);
+    whoosh(t0 + 22.8, .8, out, true);
+    whoosh(t0 + 25.6, 1.5, out, true);            // riser into the end card
+    impact(t0 + 27.15, out);
+    pad(t0 + 27.15, [220, 277.18, 329.63, 440], 2.85, out);
+    pop(t0 + 28.25, out);
+    master.gain.setValueAtTime(soundOn ? .9 : 0, t0 + 29.0);
+    master.gain.linearRampToValueAtTime(0.0001, t0 + 30);
+  }
 
   // ---- 3D ------------------------------------------------------------------
   var glCanvas = document.createElement('canvas');
@@ -224,7 +336,8 @@
     var inP = eOut(seg(t, 5.6, 7.2));
     var flip = eInOut(seg(t, 12, 13.2));
     var back = eInOut(seg(t, 16.8, 17.6)), ret = eInOut(seg(t, 22.8, 23.6)), leave = eInOut(seg(t, 26.6, 27.4));
-    var heroScale = L.size * (1 - back + ret) * (1 - leave * .35);
+    // Gone before the end card: the close is logo and contact only.
+    var heroScale = L.size * (1 - back + ret) * (1 - leave);
     var drift = Math.sin(t * 1.1) * .06;
     var hx = lerp(L.heroX, 0, ret) , hy = lerp(L.heroY, L.heroY, 1) + drift - leave * 1.2;
     if (fmt === 'h' && ret > 0) hx = lerp(L.heroX, L.heroX, ret);
@@ -305,12 +418,24 @@
   function loop(now) {
     if (!playing) return;
     var t = (now - start) / 1000;
-    if (t >= T) { t = T; playing = false; if (recorder) recorder.stop(); }
+    if (t < 0) { requestAnimationFrame(loop); return; }
+    if (t >= T) { t = T; playing = false; if (recorder) setTimeout(function () { recorder.stop(); }, 250); }
     frame(t);
     prog.style.width = (t / T * 100) + '%';
     if (playing) requestAnimationFrame(loop);
   }
-  function play() { start = performance.now(); playing = true; requestAnimationFrame(loop); }
+  // withSound is false only for the silent autoplay on load (browsers need a
+  // click before audio can start).
+  function play(withSound) {
+    if (withSound !== false && audioInit()) {
+      var lead = .06;
+      score(actx.currentTime + lead);
+      start = performance.now() + lead * 1000;
+    } else {
+      start = performance.now();
+    }
+    playing = true; requestAnimationFrame(loop);
+  }
 
   document.querySelectorAll('[data-f]').forEach(function (b) {
     b.addEventListener('click', function () {
@@ -321,6 +446,13 @@
     });
   });
   document.getElementById('play').addEventListener('click', function () { if (!recorder) play(); });
+  var snd = document.getElementById('snd');
+  snd.addEventListener('click', function () {
+    soundOn = !soundOn;
+    snd.setAttribute('aria-pressed', soundOn);
+    snd.textContent = soundOn ? 'الصوت شغال' : 'الصوت مقفول';
+    if (master) master.gain.setTargetAtTime(soundOn ? .9 : 0, actx.currentTime, .05);
+  });
 
   var note = document.getElementById('note');
   document.getElementById('rec').addEventListener('click', function () {
@@ -328,7 +460,11 @@
     var types = ['video/mp4;codecs=avc1.640028', 'video/mp4', 'video/webm;codecs=vp9', 'video/webm'];
     var type = types.filter(function (x) { return MediaRecorder.isTypeSupported(x); })[0];
     var chunks = [];
-    recorder = new MediaRecorder(out.captureStream(60), { mimeType: type, videoBitsPerSecond: 14e6 });
+    var stream = out.captureStream(60);
+    if (audioInit() && soundOn) recDest.stream.getAudioTracks().forEach(function (tr) { stream.addTrack(tr); });
+    if (soundOn && type.indexOf('mp4') >= 0 && MediaRecorder.isTypeSupported('video/mp4;codecs=avc1.640028,mp4a.40.2')) type = 'video/mp4;codecs=avc1.640028,mp4a.40.2';
+    else if (soundOn && type.indexOf('webm') >= 0 && MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')) type = 'video/webm;codecs=vp9,opus';
+    recorder = new MediaRecorder(stream, { mimeType: type, videoBitsPerSecond: 14e6, audioBitsPerSecond: 192000 });
     recorder.ondataavailable = function (e) { if (e.data.size) chunks.push(e.data); };
     recorder.onstop = function () {
       var ext = type.indexOf('mp4') >= 0 ? 'mp4' : 'webm';
@@ -358,7 +494,7 @@
     document.fonts.load('600 40px "IBM Plex Sans"'), document.fonts.load('700 40px "IBM Plex Sans"')
   ])).then(function () {
     if (q.get('t')) { frame(parseFloat(q.get('t'))); document.title = 'ready'; }
-    else play();
+    else play(false);
   });
 })();
 </script>
